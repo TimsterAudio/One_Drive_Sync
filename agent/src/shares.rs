@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -46,8 +46,46 @@ impl Default for Share {
 }
 
 impl Share {
+    /// `smb://domain;user@server/name/`. With the domain and user in it,
+    /// GVFS names the mount folder just as the file manager does
+    /// (`smb-share:domain=…,server=…,share=…,user=…`), so a pair set up on a
+    /// share the file manager connected still finds it.
     pub fn uri(&self) -> String {
-        format!("smb://{}/{}/", self.server.trim(), self.name.trim())
+        let mut who = String::new();
+        if !self.user.trim().is_empty() {
+            if !self.domain.trim().is_empty() {
+                who.push_str(&encode_userinfo(self.domain.trim()));
+                who.push(';');
+            }
+            who.push_str(&encode_userinfo(self.user.trim()));
+            who.push('@');
+        }
+        format!("smb://{who}{}/{}/", self.server.trim(), self.name.trim())
+    }
+
+    /// The share a GVFS folder belongs to, read from its
+    /// `smb-share:domain=…,server=…,share=…,user=…` part.
+    pub fn from_gvfs_path(path: &Path) -> Option<Share> {
+        let spec = path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .find_map(|c| c.strip_prefix("smb-share:"))?;
+        let mut share = Share {
+            domain: String::new(),
+            ..Default::default()
+        };
+        for kv in spec.split(',') {
+            let (k, v) = kv.split_once('=')?;
+            let v = percent_decode(v);
+            match k {
+                "server" => share.server = v,
+                "share" => share.name = v,
+                "user" => share.user = v,
+                "domain" => share.domain = v,
+                _ => {}
+            }
+        }
+        (!share.server.is_empty() && !share.name.is_empty()).then_some(share)
     }
 
     /// Identifies the share in events and the keyring.
@@ -77,6 +115,53 @@ pub enum MountState {
         message: String,
         bad_login: bool,
     },
+}
+
+/// Percent-encodes a user or domain name for an smb:// address.
+fn encode_userinfo(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b'=' => out.push(b as char),
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether `gio` (GVFS) is here to mount with.
@@ -126,6 +211,7 @@ fn failure(stdout: &str, stderr: &str) -> MountState {
     }
     let detail = stderr
         .lines()
+        .filter(|l| !l.contains("WARNING"))
         .rev()
         .find(|l| !l.trim().is_empty())
         .map(|l| {
@@ -137,7 +223,19 @@ fn failure(stdout: &str, stderr: &str) -> MountState {
                 .unwrap_or(l)
                 .to_string()
         })
-        .unwrap_or_else(|| "gio couldn't mount it".into());
+        .unwrap_or_default();
+    if detail.is_empty() && stdout.contains("Authentication Required") {
+        // Asked once and got no answer: no password was given or saved.
+        return MountState::Failed {
+            message: "enter the password to connect".into(),
+            bad_login: true,
+        };
+    }
+    let detail = if detail.is_empty() {
+        "gio couldn't mount it".to_string()
+    } else {
+        detail
+    };
     let message = match detail.as_str() {
         "Connection timed out" | "No route to host" | "Connection refused" => {
             format!("{detail} (is the PC on and sharing?)")
@@ -157,9 +255,10 @@ fn failure(stdout: &str, stderr: &str) -> MountState {
     }
 }
 
-/// Mounts the share, answering gio's prompts for the user, domain and
-/// password on its standard input (never on its command line).
-fn mount(share: &Share, password: &str) -> MountState {
+/// Mounts the share, answering gio's password prompt on its standard input
+/// (never on its command line). Without a password, GVFS can still use one
+/// the file manager saved ("Remember forever").
+fn mount(share: &Share, password: Option<&str>) -> MountState {
     let child = gio()
         .args(["mount", &share.uri()])
         .stdin(Stdio::piped())
@@ -176,12 +275,9 @@ fn mount(share: &Share, password: &str) -> MountState {
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = write!(
-            stdin,
-            "{}\n{}\n{password}\n",
-            share.user.trim(),
-            share.domain.trim()
-        );
+        if let Some(password) = password {
+            let _ = writeln!(stdin, "{password}");
+        }
     }
     // Read the output on threads so a chatty gio can't block on a full pipe.
     let reader = |pipe: Option<Box<dyn Read + Send>>| {
@@ -353,14 +449,8 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
         if !forced && (t.held || blocked) {
             return None;
         }
-        let Some(password) = password_for(&t.share, session) else {
-            t.state = MountState::Failed {
-                message: "no password saved; enter it to connect".into(),
-                bad_login: true,
-            };
-            return Some(None);
-        };
-        Some(Some(password))
+        // No password of ours: try anyway, in case GVFS has one saved.
+        Some(Some(password_for(&t.share, session)))
     };
 
     let mut next_check = Instant::now();
@@ -436,7 +526,7 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
                 Some(Some(password)) => {
                     t.state = MountState::Mounting;
                     send(t, None);
-                    t.state = mount(&t.share, &password);
+                    t.state = mount(&t.share, password.as_deref());
                     let note = match &t.state {
                         MountState::Mounted(p) => Some(format!(
                             "{}: connected at {}.",
@@ -499,6 +589,30 @@ mod tests {
     }
 
     #[test]
+    fn asked_once_means_no_password() {
+        let out =
+            "Authentication Required\nEnter password for share 'trips' on 'pc':\nPassword: \n";
+        let (m, bad) = message(failure(out, ""));
+        assert_eq!(m, "enter the password to connect");
+        assert!(bad);
+    }
+
+    #[test]
+    fn shares_from_file_manager_folders() {
+        let p = Path::new(
+            "/run/user/1000/gvfs/smb-share:domain=Home,server=192.168.0.2,share=documents,user=Tim%20&%20Sarah/Waypoint Data",
+        );
+        let s = Share::from_gvfs_path(p).unwrap();
+        assert_eq!(s.server, "192.168.0.2");
+        assert_eq!(s.name, "documents");
+        assert_eq!(s.user, "Tim & Sarah");
+        assert_eq!(s.domain, "Home");
+        // Mounting this address makes GVFS use that same folder.
+        assert_eq!(s.uri(), "smb://Home;Tim%20&%20Sarah@192.168.0.2/documents/");
+        assert!(Share::from_gvfs_path(Path::new("/mnt/pc/trips")).is_none());
+    }
+
+    #[test]
     fn names() {
         let s = Share {
             server: "ATLAS".into(),
@@ -506,7 +620,7 @@ mod tests {
             user: "me@outlook.com".into(),
             ..Default::default()
         };
-        assert_eq!(s.uri(), "smb://ATLAS/trips/");
+        assert_eq!(s.uri(), "smb://WORKGROUP;me%40outlook.com@ATLAS/trips/");
         assert_eq!(s.label(), "\\\\ATLAS\\trips");
         assert_eq!(s.key(), "smb://me@outlook.com@ATLAS/trips");
     }

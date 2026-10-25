@@ -4,6 +4,15 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
+## 0.3.1 – 2026-10-25
+
+Folder Sync only; the crate is unchanged.
+
+- Shares are mounted as `smb://domain;user@server/share/`, so GVFS puts them in the same folder the file manager does (`smb-share:domain=…,server=…,share=…,user=…`). Before, a pair set up on a share the file manager had connected never matched Folder Sync's own mount.
+- A pair pointing into a share the file manager connected now adds that share to **Shares on other computers**, so Folder Sync reconnects it after a restart.
+- With no saved password, Folder Sync still tries to connect, so a password the file manager saved ("Remember forever") is used; otherwise the share asks for it.
+- **Copy** next to the log copies it as text.
+
 ## 0.3.0 – 2026-10-25 – commit ad103cf
 
 Folder Sync only; the crate is unchanged.

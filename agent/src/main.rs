@@ -158,6 +158,7 @@ impl App {
                 app.note(Level::Warn, format!("Couldn't update the login entry: {e}"));
             }
         }
+        app.adopt_pair_shares();
         if app.settings.pairs.is_empty() {
             app.note(Level::Info, "Add a folder pair below to start.");
         }
@@ -256,6 +257,7 @@ impl App {
         );
         self.settings.pairs.push(pair);
         self.pairs_changed();
+        self.adopt_pair_shares();
         self.new_local.clear();
         self.new_share.clear();
     }
@@ -369,6 +371,38 @@ impl App {
     fn save_settings(&mut self) {
         if let Err(e) = self.settings.save() {
             self.note(Level::Error, format!("Couldn't save settings: {e}"));
+        }
+    }
+
+    /// Adds the shares that pairs point into (a folder the file manager
+    /// connected, under `/run/user/…/gvfs/`), so Folder Sync reconnects them.
+    fn adopt_pair_shares(&mut self) {
+        if self.mounter.is_none() {
+            return;
+        }
+        let found: Vec<Share> = self
+            .settings
+            .pairs
+            .iter()
+            .filter_map(|p| p.share.as_deref().and_then(Share::from_gvfs_path))
+            .collect();
+        let mut added = false;
+        for share in found {
+            if self.settings.shares.iter().any(|s| s.key() == share.key()) {
+                continue;
+            }
+            self.note(
+                Level::Info,
+                format!(
+                    "Found {} in a pair; Folder Sync will connect it from now on.",
+                    share.label()
+                ),
+            );
+            self.settings.shares.push(share);
+            added = true;
+        }
+        if added {
+            self.shares_changed();
         }
     }
 
@@ -605,6 +639,14 @@ impl App {
     fn log_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Log");
+            if ui.small_button("Copy").clicked() {
+                let text: String = self
+                    .log
+                    .iter()
+                    .map(|e| format!("{} {}\n", e.at, e.text))
+                    .collect();
+                ui.ctx().copy_text(text);
+            }
             if ui.small_button("Clear").clicked() {
                 self.log.clear();
             }

@@ -38,6 +38,8 @@ Folder Sync connects through GVFS, the same service the file manager uses for **
 - **A refused password is not retried.** That way a stale password can't lock your Windows account. The share asks for the password again instead.
 - **Disconnect** keeps a share disconnected until you click **Connect**. **Remove** disconnects it and forgets its password.
 
+A pair set up on a share you connected in the file manager (Nemo) works too: Folder Sync spots the share in the pair's folder, adds it to the list and reconnects it from then on. If you ticked "Remember forever" when connecting in Nemo, that saved password is used; otherwise Folder Sync asks for it once.
+
 If you'd rather mount the shares yourself (`cifs` in `/etc/fstab`, say), skip this step and point the pairs at those folders.
 
 ### 3. Run Folder Sync
