@@ -12,6 +12,8 @@ Folder Sync only; the crate is unchanged.
 - A pair pointing into a share the file manager connected now adds that share to **Shares on other computers**, so Folder Sync reconnects it after a restart.
 - With no saved password, Folder Sync still tries to connect, so a password the file manager saved ("Remember forever") is used; otherwise the share asks for it.
 - **Copy** next to the log copies it as text.
+- Share passwords are asked for once: saved in the keyring, or, where there's no keyring, in `passwords.json` beside the settings, readable only by the user. The log says where. (Before, without a keyring, a password lasted only until Folder Sync closed.)
+- Fixed: a share whose GVFS folder appeared a moment after `gio mount` returned was reported as failed and only picked up at the next check, a minute later. It now waits up to 10 s for the folder.
 
 ## 0.3.0 – 2026-10-25 – commit ad103cf
 

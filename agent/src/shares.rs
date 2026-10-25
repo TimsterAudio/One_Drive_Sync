@@ -321,7 +321,7 @@ fn mount(share: &Share, password: Option<&str>) -> MountState {
             message: "timed out (is the PC on?)".into(),
             bad_login: false,
         },
-        Some(s) if s.success() => match local_path(share) {
+        Some(s) if s.success() => match wait_for_folder(share) {
             Some(p) => MountState::Mounted(p),
             None => MountState::Failed {
                 message: "mounted, but GVFS gave it no folder (is gvfs-fuse installed?)".into(),
@@ -329,6 +329,20 @@ fn mount(share: &Share, password: Option<&str>) -> MountState {
             },
         },
         Some(_) => failure(&stdout, &stderr),
+    }
+}
+
+/// The mount's folder, which GVFS can show a moment after the mount itself.
+fn wait_for_folder(share: &Share) -> Option<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(p) = local_path(share) {
+            return Some(p);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -346,14 +360,107 @@ fn keyring_entry(share: &Share) -> Option<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, &share.key()).ok()
 }
 
-pub fn forget_password(share: &Share) {
-    if let Some(e) = keyring_entry(share) {
-        let _ = e.delete_credential();
+/// Where a password was saved.
+#[derive(Debug, PartialEq, Eq)]
+enum Saved {
+    Keyring,
+    /// In the passwords file, readable only by this user.
+    File,
+    /// Only until Folder Sync closes.
+    Session,
+}
+
+/// Share passwords: in the system keyring, or, where there's no keyring to
+/// be had, in a file only this user can read (like `~/.smbcredentials`).
+struct Passwords {
+    file: PathBuf,
+    session: HashMap<String, String>,
+}
+
+impl Passwords {
+    fn read_file(&self) -> HashMap<String, String> {
+        std::fs::read(&self.file)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_file(&self, map: &HashMap<String, String>) -> std::io::Result<()> {
+        if map.is_empty() {
+            return match std::fs::remove_file(&self.file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        if let Some(dir) = self.file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let bytes = serde_json::to_vec_pretty(map).map_err(std::io::Error::other)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&self.file)?.write_all(&bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.file, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    fn get(&self, share: &Share) -> Option<String> {
+        let key = share.key();
+        self.session
+            .get(&key)
+            .cloned()
+            .or_else(|| keyring_entry(share)?.get_password().ok())
+            .or_else(|| self.read_file().remove(&key))
+    }
+
+    fn set(&mut self, share: &Share, password: String) -> Saved {
+        let key = share.key();
+        let in_keyring = keyring_entry(share)
+            .map(|e| e.set_password(&password).is_ok())
+            .unwrap_or(false);
+        let mut file = self.read_file();
+        if in_keyring {
+            self.session.remove(&key);
+            if file.remove(&key).is_some() {
+                let _ = self.write_file(&file);
+            }
+            return Saved::Keyring;
+        }
+        file.insert(key.clone(), password.clone());
+        if self.write_file(&file).is_ok() {
+            self.session.remove(&key);
+            Saved::File
+        } else {
+            self.session.insert(key, password);
+            Saved::Session
+        }
+    }
+
+    fn forget(&mut self, share: &Share) {
+        let key = share.key();
+        self.session.remove(&key);
+        if let Some(e) = keyring_entry(share) {
+            let _ = e.delete_credential();
+        }
+        let mut file = self.read_file();
+        if file.remove(&key).is_some() {
+            let _ = self.write_file(&file);
+        }
     }
 }
 
 enum Cmd {
     SetShares(Vec<Share>),
+    /// Forget a removed share's password.
+    Forget(Share),
     /// Mount now, with a newly entered password if given.
     Mount(String, Option<String>),
     Unmount(String),
@@ -375,12 +482,17 @@ pub struct Mounter {
 }
 
 impl Mounter {
-    pub fn start(wake: Box<dyn Fn() + Send>) -> Self {
+    /// `password_file` is where passwords go if the keyring can't take them.
+    pub fn start(password_file: PathBuf, wake: Box<dyn Fn() + Send>) -> Self {
         let (tx, rx) = mpsc::channel();
         let (etx, events) = mpsc::channel();
+        let passwords = Passwords {
+            file: password_file,
+            session: HashMap::new(),
+        };
         std::thread::Builder::new()
             .name("mounter".into())
-            .spawn(move || run(rx, etx, wake))
+            .spawn(move || run(rx, etx, wake, passwords))
             .expect("couldn't start the mount thread");
         Self { tx, events }
     }
@@ -391,6 +503,12 @@ impl Mounter {
 
     pub fn mount(&self, key: &str, password: Option<String>) {
         let _ = self.tx.send(Cmd::Mount(key.to_string(), password));
+    }
+
+    /// Disconnects the share and forgets its password.
+    pub fn remove(&self, share: &Share) {
+        let _ = self.tx.send(Cmd::Unmount(share.key()));
+        let _ = self.tx.send(Cmd::Forget(share.clone()));
     }
 
     pub fn unmount(&self, key: &str) {
@@ -409,10 +527,13 @@ struct Tracked {
     held: bool,
 }
 
-fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>) {
+fn run(
+    rx: Receiver<Cmd>,
+    events: Sender<MountEvent>,
+    wake: Box<dyn Fn() + Send>,
+    mut passwords: Passwords,
+) {
     let mut shares: Vec<Tracked> = Vec::new();
-    // Passwords for this session when the keyring can't keep them.
-    let mut session: HashMap<String, String> = HashMap::new();
     let send = |t: &Tracked, note: Option<String>| {
         let _ = events.send(MountEvent {
             key: t.share.key(),
@@ -422,14 +543,7 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
         wake();
     };
 
-    let password_for = |share: &Share, session: &HashMap<String, String>| {
-        session
-            .get(&share.key())
-            .cloned()
-            .or_else(|| keyring_entry(share)?.get_password().ok())
-    };
-
-    let ensure = |t: &mut Tracked, session: &HashMap<String, String>, forced: bool| {
+    let ensure = |t: &mut Tracked, passwords: &Passwords, forced: bool| {
         if let MountState::Mounted(p) = &t.state {
             if p.is_dir() {
                 return None;
@@ -450,7 +564,7 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
             return None;
         }
         // No password of ours: try anyway, in case GVFS has one saved.
-        Some(Some(password_for(&t.share, session)))
+        Some(Some(passwords.get(&t.share)))
     };
 
     let mut next_check = Instant::now();
@@ -479,24 +593,25 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
                 if let Some(t) = shares.iter_mut().find(|t| t.share.key() == key) {
                     t.held = false;
                     if let Some(p) = password {
-                        let saved = keyring_entry(&t.share)
-                            .map(|e| e.set_password(&p).is_ok())
-                            .unwrap_or(false);
-                        if saved {
-                            session.remove(&key);
-                        } else {
-                            session.insert(key.clone(), p);
-                            send(
-                                t,
-                                Some(format!(
-                                    "{}: couldn't save the password to the keyring; it's kept until Folder Sync closes.",
-                                    t.share.label()
-                                )),
-                            );
-                        }
+                        let note = match passwords.set(&t.share, p) {
+                            Saved::Keyring => "password saved in the keyring".to_string(),
+                            Saved::File => format!(
+                                "no keyring to save the password in, so it's saved in {} (only you can read it)",
+                                passwords.file.display()
+                            ),
+                            Saved::Session => {
+                                "couldn't save the password; it's kept until Folder Sync closes"
+                                    .to_string()
+                            }
+                        };
+                        send(t, Some(format!("{}: {note}.", t.share.label())));
                     }
                     forced = Some(key);
                 }
+            }
+            Some(Cmd::Forget(share)) => {
+                passwords.forget(&share);
+                continue;
             }
             Some(Cmd::Unmount(key)) => {
                 if let Some(t) = shares.iter_mut().find(|t| t.share.key() == key) {
@@ -516,7 +631,7 @@ fn run(rx: Receiver<Cmd>, events: Sender<MountEvent>, wake: Box<dyn Fn() + Send>
         for t in shares.iter_mut() {
             let is_forced = forced.as_deref() == Some(t.share.key().as_str());
             let before = t.state.clone();
-            match ensure(t, &session, is_forced) {
+            match ensure(t, &passwords, is_forced) {
                 None => {}
                 Some(None) => {
                     if t.state != before {
@@ -610,6 +725,34 @@ mod tests {
         // Mounting this address makes GVFS use that same folder.
         assert_eq!(s.uri(), "smb://Home;Tim%20&%20Sarah@192.168.0.2/documents/");
         assert!(Share::from_gvfs_path(Path::new("/mnt/pc/trips")).is_none());
+    }
+
+    #[test]
+    fn password_file_fallback() {
+        let dir = std::env::temp_dir().join(format!("fs-pw-{}", std::process::id()));
+        let pw = Passwords {
+            file: dir.join("passwords.json"),
+            session: HashMap::new(),
+        };
+        let share = Share {
+            server: "pc".into(),
+            name: "x".into(),
+            user: "me".into(),
+            ..Default::default()
+        };
+        let mut map = HashMap::new();
+        map.insert(share.key(), "secret".to_string());
+        pw.write_file(&map).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pw.file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(pw.read_file().get(&share.key()).unwrap(), "secret");
+        pw.write_file(&HashMap::new()).unwrap();
+        assert!(!pw.file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

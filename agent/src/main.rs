@@ -119,7 +119,10 @@ impl App {
         let settings = Settings::load();
         let mounter = shares::available().then(|| {
             let ctx = ctx.clone();
-            let m = Mounter::start(Box::new(move || ctx.request_repaint()));
+            let m = Mounter::start(
+                data_dir().join("passwords.json"),
+                Box::new(move || ctx.request_repaint()),
+            );
             m.set_shares(settings.shares.clone());
             m
         });
@@ -189,9 +192,12 @@ impl App {
                 self.service.sync_now();
             }
             if let Some(note) = e.note {
-                let level = match e.state {
-                    MountState::Failed { .. } => Level::Warn,
-                    _ => Level::Info,
+                // Failures say "couldn't"; other notes (a saved password,
+                // a disconnect asked for) are just news.
+                let level = if note.contains("couldn't") {
+                    Level::Warn
+                } else {
+                    Level::Info
                 };
                 self.note(level, note);
             }
@@ -535,9 +541,8 @@ impl App {
                 if let Some(i) = remove {
                     let share = self.settings.shares.remove(i);
                     if let Some(m) = &self.mounter {
-                        m.unmount(&share.key());
+                        m.remove(&share);
                     }
-                    shares::forget_password(&share);
                     self.mounts.remove(&share.key());
                     self.note(Level::Info, format!("Removed {}.", share.label()));
                     self.shares_changed();
