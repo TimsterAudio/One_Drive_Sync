@@ -4,6 +4,14 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
+## 0.3.0 – 2026-10-25
+
+Folder Sync only; the crate is unchanged.
+
+- **Shares on other computers**: Folder Sync connects Windows shares itself through GVFS (`gio mount`, no root, no command line), with the password in the system keyring. It reconnects at start and within a minute of a share dropping, but doesn't retry a refused password, so a stale one can't lock the Windows account. Shares can be disconnected and removed (which forgets the password).
+- The pair form's **Shares…** button fills in a connected share's folder.
+- Settings gain `shares` (empty by default, so earlier settings load as before).
+
 ## 0.2.1 – 2026-10-25 – commit eadbe57
 
 Folder Sync only; the crate is unchanged.

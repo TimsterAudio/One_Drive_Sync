@@ -1239,9 +1239,10 @@ dependencies = [
 
 [[package]]
 name = "folder-sync"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "eframe",
+ "keyring",
  "one_drive_sync",
  "rfd",
  "serde",
@@ -2629,7 +2630,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "one_drive_sync"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "gethostname",

@@ -1,18 +1,18 @@
 # One_Drive_Sync
 
-A small Rust crate and app that keep folders on two computers in step, like SyncToy. Run **Folder Sync** on the Linux machine, and it syncs its folders with folders on the Windows PC through a share mounted over the LAN. The Windows PC needs nothing installed. If those folders sit inside the PC's OneDrive folder, OneDrive's own app carries them on to the cloud and the iPhone.
+A small Rust crate and app that keep folders on two computers in step, like SyncToy. Run **Folder Sync** on the Linux machine, and it connects to the Windows PC's shared folders over the LAN and syncs with them. The Windows PC needs nothing installed. If those folders sit inside the PC's OneDrive folder, OneDrive's own app carries them on to the cloud and the iPhone.
 
-The crate started as a OneDrive client. That code is still here, behind the `onedrive` feature, for when an app needs to talk to OneDrive directly; see [OneDrive](#onedrive-parked). Folder Sync doesn't build it, so it needs no Azure registration, sign-in or keychain.
+The crate started as a OneDrive client. That code is still here, behind the `onedrive` feature, for when an app needs to talk to OneDrive directly; see [OneDrive](#onedrive-parked). Folder Sync doesn't build it, so it needs no Azure registration or Microsoft sign-in.
 
-**Status: 0.2.0, trial.** It works end to end against local folders and in the tests. It still needs a try across a real Windows share (see [Trying it](#trying-it)).
+**Status: 0.3.0, trial.** It works end to end in the tests and against a Samba share (standing in for the PC) connected through GVFS. It still needs a try with the real Windows PC (see [Trying it](#trying-it)).
 
 ## How it fits together
 
 ```
 Linux                            Windows PC
-~/Waypoint/trips  ⇄ Folder Sync ⇄  /mnt/pc-trips  =  \\PC\trips  (C:\Users\you\OneDrive\Waypoint\trips)
-~/weather         → Folder Sync →  /mnt/pc-weather =  \\PC\weather                  │
-                                                                   OneDrive app ──► cloud, iPhone
+~/Waypoint/trips  ⇄ Folder Sync ⇄  \\PC\trips  (C:\Users\you\OneDrive\Waypoint\trips)
+~/weather         → Folder Sync →  \\PC\weather                  │
+                                                  OneDrive app ──► cloud, iPhone
 ```
 
 ## Trying it
@@ -27,25 +27,18 @@ For each folder (a Waypoint trip folder, the weather folder):
 
 If the folders are inside the PC's OneDrive folder, right-click them in Explorer and choose **Always keep on this device**. That makes sure the share holds real files, not online-only placeholders.
 
-### 2. Mount the share on Linux
+### 2. Connect the shares from Folder Sync
 
-**Option A: mount it permanently (recommended).** This is more reliable for a background sync, and it mounts at boot.
+Run Folder Sync (next step). Under **Shares on other computers**, enter the PC's name (or its IP address), the share name, your Windows user name and your password, then click **Add and connect**. With a Microsoft account login on Windows, the user name is the account's email address and the password is that account's password.
 
-```sh
-sudo apt install cifs-utils
-sudo mkdir -p /mnt/pc-trips
-printf 'username=YOUR_WINDOWS_USER\npassword=YOUR_PASSWORD\n' > ~/.smb-pc && chmod 600 ~/.smb-pc
-```
+Folder Sync connects through GVFS, the same service the file manager uses for **Connect to Server**, so it needs no root and no command line. On Mint it's already installed; elsewhere, install `gvfs-backends` and `gvfs-fuse`. A connected share appears as a folder under `/run/user/1000/gvfs/`, and the **Shares…** button in the pair form fills that folder in.
 
-Then add a line to `/etc/fstab` (one per share):
+- **The password** is kept in the system keyring (Passwords and Keys, unlocked when you log in). If the keyring can't take it, Folder Sync keeps it only until it closes and says so in the log.
+- **Shares reconnect by themselves:** at start, and within a minute of dropping (the PC slept, the network blinked). Meanwhile the pairs on that share wait, and nothing is deleted.
+- **A refused password is not retried.** That way a stale password can't lock your Windows account. The share asks for the password again instead.
+- **Disconnect** keeps a share disconnected until you click **Connect**. **Remove** disconnects it and forgets its password.
 
-```
-//PC-NAME/trips  /mnt/pc-trips  cifs  credentials=/home/YOU/.smb-pc,uid=1000,gid=1000,iocharset=utf8,nofail,_netdev,x-systemd.automount  0  0
-```
-
-Run `sudo mount -a`. With a Microsoft account login on Windows, the user name is the account's email address, and the password is that account's password.
-
-**Option B: mount it from the file manager.** In GNOME Files, open **Other Locations** and connect to `smb://PC-NAME/trips`. The folder then appears under `/run/user/1000/gvfs/`. This is fine for a quick try, but it disappears when you log out.
+If you'd rather mount the shares yourself (`cifs` in `/etc/fstab`, say), skip this step and point the pairs at those folders.
 
 ### 3. Run Folder Sync
 
@@ -55,12 +48,12 @@ cargo run --release -p folder-sync
 
 CI also builds a Linux and a Windows copy on every push, under the run's artifacts.
 
-Add a pair: **This computer** is the local folder, and **Other folder** is the mounted share (use Browse…). Choose the mode:
+Add a pair: **This computer** is the local folder, and **Other folder** is the share (**Shares…** fills in a connected one; use Browse… to pick a subfolder inside it). Choose the mode:
 
 - **Two-way** for the trip folder.
 - **Push** for the weather files: this computer's changes go across, deletions included. Copies changed on the PC are replaced, nothing comes back, and files on the PC that this pair never sent are left alone.
 
-To have it start by itself, tick **Start when I log in** (top right). This adds an entry to `~/.config/autostart/`, which Linux Mint's Cinnamon (and GNOME, KDE, Xfce) reads at login. Folder Sync then opens minimised, 10 seconds after login, giving network shares time to mount. If a share isn't mounted yet, the pair shows an error and retries at its next check. The entry points at the copy of `folder-sync` that ticked the box, so tick it from the copy you'll keep (say, `~/.local/bin/folder-sync`). Untick the box to remove the entry. You can also see and toggle it in Mint's **Startup Applications**.
+To have it start by itself, tick **Start when I log in** (top right). This adds an entry to `~/.config/autostart/`, which Linux Mint's Cinnamon (and GNOME, KDE, Xfce) reads at login. Folder Sync then opens minimised, 10 seconds after login, and connects its shares. If a share isn't reachable yet, its pairs wait and Folder Sync keeps trying. The entry points at the copy of `folder-sync` that ticked the box, so tick it from the copy you'll keep (say, `~/.local/bin/folder-sync`). Untick the box to remove the entry. You can also see and toggle it in Mint's **Startup Applications**.
 
 Pairs and their state are kept in `~/.local/share/folder-sync/` (`%APPDATA%\Folder Sync\` on Windows). Removing a pair touches no files.
 

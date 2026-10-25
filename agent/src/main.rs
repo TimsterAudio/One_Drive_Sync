@@ -6,14 +6,16 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod shares;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use one_drive_sync::engine::Level;
 use one_drive_sync::{Event, Mode, PairConfig, PairStatus, SyncOptions, SyncService};
 use serde::{Deserialize, Serialize};
+use shares::{MountState, Mounter, Share};
 use time::UtcOffset;
 
 const APP: &str = "Folder Sync";
@@ -23,6 +25,8 @@ const LOG_LINES: usize = 500;
 #[serde(default)]
 struct Settings {
     pairs: Vec<PairConfig>,
+    /// Shares on other computers, mounted at start.
+    shares: Vec<Share>,
 }
 
 fn data_dir() -> PathBuf {
@@ -75,6 +79,16 @@ struct App {
     /// Where the login entry goes; `None` where autostart isn't offered.
     autostart_dir: Option<PathBuf>,
     autostart_on: bool,
+    /// Mounts the shares; `None` where GVFS isn't available.
+    mounter: Option<Mounter>,
+    mounts: HashMap<String, MountState>,
+    /// Passwords being typed, by share key.
+    passwords: HashMap<String, String>,
+    // The add-share form.
+    new_server: String,
+    new_share_name: String,
+    new_user: String,
+    new_password: String,
     // The add-pair form.
     new_local: String,
     new_share: String,
@@ -103,6 +117,12 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         let settings = Settings::load();
+        let mounter = shares::available().then(|| {
+            let ctx = ctx.clone();
+            let m = Mounter::start(Box::new(move || ctx.request_repaint()));
+            m.set_shares(settings.shares.clone());
+            m
+        });
         let service = SyncService::start_folders(
             data_dir().join("state"),
             SyncOptions::default(),
@@ -117,6 +137,13 @@ impl App {
             log: VecDeque::new(),
             autostart_on: autostart::dir().is_some_and(|d| autostart::is_on(&d)),
             autostart_dir: autostart::dir(),
+            mounter,
+            mounts: HashMap::new(),
+            passwords: HashMap::new(),
+            new_server: String::new(),
+            new_share_name: String::new(),
+            new_user: String::new(),
+            new_password: String::new(),
             new_local: String::new(),
             new_share: String::new(),
             new_mode: Mode::TwoWay,
@@ -149,6 +176,26 @@ impl App {
     }
 
     fn poll(&mut self) {
+        let mount_events = self
+            .mounter
+            .as_ref()
+            .map(|m| m.events())
+            .unwrap_or_default();
+        for e in mount_events {
+            let was_mounted = matches!(self.mounts.get(&e.key), Some(MountState::Mounted(_)));
+            if matches!(e.state, MountState::Mounted(_)) && !was_mounted {
+                // A share came (back): sync the pairs on it now.
+                self.service.sync_now();
+            }
+            if let Some(note) = e.note {
+                let level = match e.state {
+                    MountState::Failed { .. } => Level::Warn,
+                    _ => Level::Info,
+                };
+                self.note(level, note);
+            }
+            self.mounts.insert(e.key, e.state);
+        }
         for e in self.service.events() {
             match e {
                 Event::Log {
@@ -319,6 +366,186 @@ impl App {
         }
     }
 
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.note(Level::Error, format!("Couldn't save settings: {e}"));
+        }
+    }
+
+    fn shares_changed(&mut self) {
+        self.save_settings();
+        if let Some(m) = &self.mounter {
+            m.set_shares(self.settings.shares.clone());
+        }
+    }
+
+    fn add_share(&mut self) {
+        let share = Share {
+            server: self.new_server.trim().trim_start_matches('\\').to_string(),
+            name: self.new_share_name.trim().trim_matches('\\').to_string(),
+            user: self.new_user.trim().to_string(),
+            ..Default::default()
+        };
+        if share.server.is_empty() || share.name.is_empty() || share.user.is_empty() {
+            self.note(
+                Level::Warn,
+                "Enter the computer, the share and your user name.",
+            );
+            return;
+        }
+        if self.settings.shares.iter().any(|s| s.key() == share.key()) {
+            self.note(
+                Level::Warn,
+                format!("{} is already in the list.", share.label()),
+            );
+            return;
+        }
+        let key = share.key();
+        self.note(Level::Info, format!("Connecting to {}…", share.label()));
+        self.settings.shares.push(share);
+        self.shares_changed();
+        if let Some(m) = &self.mounter {
+            m.mount(&key, Some(std::mem::take(&mut self.new_password)));
+        }
+        self.new_share_name.clear();
+    }
+
+    fn shares_section(&mut self, ui: &mut egui::Ui) {
+        if self.mounter.is_none() {
+            return;
+        }
+        let any_down = self
+            .settings
+            .shares
+            .iter()
+            .any(|s| !matches!(self.mounts.get(&s.key()), Some(MountState::Mounted(_))));
+        egui::CollapsingHeader::new(egui::RichText::new("Shares on other computers").heading())
+            .default_open(self.settings.shares.is_empty() || any_down)
+            .show(ui, |ui| {
+                let mut remove = None;
+                let mut action: Option<(String, Option<String>, bool)> = None;
+                for (i, share) in self.settings.shares.iter().enumerate() {
+                    let key = share.key();
+                    let state = self
+                        .mounts
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or(MountState::Unknown);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.strong(share.label());
+                            ui.weak(format!("as {}", share.user));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                    match &state {
+                                        MountState::Mounted(_) => {
+                                            if ui.small_button("Disconnect").clicked() {
+                                                action = Some((key.clone(), None, false));
+                                            }
+                                        }
+                                        MountState::Mounting => {}
+                                        _ => {
+                                            if ui.small_button("Connect").clicked() {
+                                                let pw = self
+                                                    .passwords
+                                                    .get(&key)
+                                                    .filter(|p| !p.is_empty())
+                                                    .cloned();
+                                                action = Some((key.clone(), pw, true));
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        let (text, colour) = mount_text(&state);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).color(colour)).truncate(),
+                        );
+                        if let MountState::Failed {
+                            bad_login: true, ..
+                        } = state
+                        {
+                            ui.horizontal(|ui| {
+                                ui.label("Password");
+                                let pw = self.passwords.entry(key.clone()).or_default();
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(pw)
+                                        .password(true)
+                                        .desired_width(200.0),
+                                );
+                                let enter = edit.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if (ui.button("Connect").clicked() || enter) && !pw.is_empty() {
+                                    action = Some((key.clone(), Some(std::mem::take(pw)), true));
+                                }
+                            });
+                        }
+                    });
+                }
+                if let Some((key, password, connect)) = action {
+                    if let Some(m) = &self.mounter {
+                        if connect {
+                            self.passwords.remove(&key);
+                            m.mount(&key, password);
+                        } else {
+                            m.unmount(&key);
+                        }
+                    }
+                }
+                if let Some(i) = remove {
+                    let share = self.settings.shares.remove(i);
+                    if let Some(m) = &self.mounter {
+                        m.unmount(&share.key());
+                    }
+                    shares::forget_password(&share);
+                    self.mounts.remove(&share.key());
+                    self.note(Level::Info, format!("Removed {}.", share.label()));
+                    self.shares_changed();
+                }
+
+                ui.add_space(4.0);
+                egui::Grid::new("add-share").num_columns(2).show(ui, |ui| {
+                    ui.label("Computer");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_server)
+                            .desired_width(240.0)
+                            .hint_text("its name or address, e.g. ATLAS"),
+                    );
+                    ui.end_row();
+                    ui.label("Share");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_share_name)
+                            .desired_width(240.0)
+                            .hint_text("e.g. trips"),
+                    );
+                    ui.end_row();
+                    ui.label("User");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_user)
+                            .desired_width(240.0)
+                            .hint_text("Windows user, or Microsoft account email"),
+                    );
+                    ui.end_row();
+                    ui.label("Password");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_password)
+                            .password(true)
+                            .desired_width(240.0),
+                    );
+                    ui.end_row();
+                });
+                if ui.button("Add and connect").clicked() {
+                    self.add_share();
+                }
+            });
+    }
+
     fn add_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Add folder pair");
         egui::Grid::new("add").num_columns(2).show(ui, |ui| {
@@ -326,11 +553,32 @@ impl App {
             folder_field(ui, &mut self.new_local, "e.g. ~/Waypoint/trips");
             ui.end_row();
             ui.label("Other folder");
-            folder_field(
-                ui,
-                &mut self.new_share,
-                "the mounted share, e.g. /mnt/pc/trips",
-            );
+            ui.horizontal(|ui| {
+                folder_field(
+                    ui,
+                    &mut self.new_share,
+                    "a connected share, or e.g. /mnt/pc/trips",
+                );
+                let mounted: Vec<(String, PathBuf)> = self
+                    .settings
+                    .shares
+                    .iter()
+                    .filter_map(|s| match self.mounts.get(&s.key()) {
+                        Some(MountState::Mounted(p)) => Some((s.label(), p.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if !mounted.is_empty() {
+                    ui.menu_button("Shares…", |ui| {
+                        for (label, path) in mounted {
+                            if ui.button(label).clicked() {
+                                self.new_share = path.display().to_string();
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            });
             ui.end_row();
             ui.label("Mode");
             ui.horizontal(|ui| {
@@ -391,6 +639,21 @@ fn folder_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
     });
 }
 
+fn mount_text(state: &MountState) -> (String, egui::Color32) {
+    match state {
+        MountState::Unknown => ("checking…".into(), egui::Color32::GRAY),
+        MountState::Mounting => ("connecting…".into(), egui::Color32::from_rgb(70, 130, 220)),
+        MountState::Mounted(p) => (
+            format!("connected · {}", p.display()),
+            egui::Color32::from_rgb(60, 160, 90),
+        ),
+        MountState::Failed { message, .. } => (
+            format!("not connected: {message}"),
+            egui::Color32::from_rgb(210, 70, 60),
+        ),
+    }
+}
+
 /// How a pair's mode reads between its folders.
 fn arrow(mode: Mode) -> &'static str {
     match mode {
@@ -437,6 +700,8 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::CentralPanel::default().show(ui, |ui| {
+            self.shares_section(ui);
+            ui.separator();
             self.pairs_section(ui);
             ui.separator();
             self.add_section(ui);
