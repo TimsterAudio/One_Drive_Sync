@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Build the agent
+        run: cargo build --release -p odsync-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: odsync-agent-${{ matrix.os }}
+          path: |
+            target/release/odsync-agent
+            target/release/odsync-agent.exe
+          if-no-files-found: ignore
