@@ -4,7 +4,7 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
-## 0.3.0 – 2026-10-25
+## 0.3.0 – 2026-10-25 – commit ad103cf
 
 Folder Sync only; the crate is unchanged.
 
