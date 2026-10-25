@@ -11,6 +11,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 
 use crate::engine::{self, Level, PairConfig, Report, SyncError, SyncOptions};
+use crate::folder::FolderDrive;
 use crate::local::{self, TMP_SUFFIX};
 use crate::remote::{RemoteDrive, RemoteError};
 
@@ -66,17 +67,37 @@ pub fn state_path(state_dir: &Path, pair: &PairConfig) -> PathBuf {
     let mut h = Sha256::new();
     h.update(pair.local.to_string_lossy().as_bytes());
     h.update(b"\n");
-    h.update(pair.remote.as_bytes());
+    h.update(pair.remote_name().as_bytes());
     let digest = h.finalize();
     let id: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     state_dir.join(format!("pair-{id}.json"))
 }
 
 impl SyncService {
-    /// Starts the worker. `wake` is called after each batch of events (an
-    /// egui app passes `ctx.request_repaint`).
+    /// Starts the worker, with `drive` for the pairs that sync with OneDrive.
+    /// `wake` is called after each batch of events (an egui app passes
+    /// `ctx.request_repaint`).
     pub fn start(
         drive: Box<dyn RemoteDrive + Send>,
+        state_dir: PathBuf,
+        options: SyncOptions,
+        wake: Box<dyn Fn() + Send>,
+    ) -> Self {
+        Self::spawn(Some(drive), state_dir, options, wake)
+    }
+
+    /// Starts the worker for pairs whose other side is a folder
+    /// ([`PairConfig::folders`]); OneDrive pairs fail with a message.
+    pub fn start_folders(
+        state_dir: PathBuf,
+        options: SyncOptions,
+        wake: Box<dyn Fn() + Send>,
+    ) -> Self {
+        Self::spawn(None, state_dir, options, wake)
+    }
+
+    fn spawn(
+        drive: Option<Box<dyn RemoteDrive + Send>>,
         state_dir: PathBuf,
         options: SyncOptions,
         wake: Box<dyn Fn() + Send>,
@@ -85,7 +106,7 @@ impl SyncService {
         let (etx, events) = mpsc::channel();
         let watch_tx = tx.clone();
         let thread = std::thread::Builder::new()
-            .name("onedrive-sync".into())
+            .name("folder-sync".into())
             .spawn(move || {
                 Worker {
                     drive,
@@ -139,11 +160,14 @@ struct PairRun {
     /// A change was seen; sync at this time unless more changes come.
     pending: Option<Instant>,
     last_error: Option<String>,
+    /// The other side, for a pair synced with a folder.
+    folder: Option<FolderDrive>,
     _watcher: Option<RecommendedWatcher>,
 }
 
 struct Worker {
-    drive: Box<dyn RemoteDrive + Send>,
+    /// OneDrive, for pairs without a share folder.
+    drive: Option<Box<dyn RemoteDrive + Send>>,
     state_dir: PathBuf,
     options: SyncOptions,
     events: Sender<Event>,
@@ -216,12 +240,14 @@ impl Worker {
             .enumerate()
             .map(|(i, config)| {
                 let watcher = self.watch(i, &config.local);
+                let folder = config.share.clone().map(FolderDrive::new);
                 PairRun {
                     state_path: state_path(&self.state_dir, &config),
                     config,
                     next_poll: now,
                     pending: None,
                     last_error: None,
+                    folder,
                     _watcher: watcher,
                 }
             })
@@ -280,14 +306,23 @@ impl Worker {
         });
         (self.wake)();
         let mut lines = Vec::new();
-        let p = &self.pairs[i];
-        let result = engine::sync(
-            &p.config,
-            &self.options,
-            &p.state_path,
-            self.drive.as_mut(),
-            &mut |line| lines.push(line),
-        );
+        let p = &mut self.pairs[i];
+        let drive: Option<&mut dyn RemoteDrive> = match &mut p.folder {
+            Some(f) => Some(f),
+            None => self.drive.as_deref_mut().map(|d| d as &mut dyn RemoteDrive),
+        };
+        let result = match drive {
+            Some(drive) => engine::sync(
+                &p.config,
+                &self.options,
+                &p.state_path,
+                drive,
+                &mut |line| lines.push(line),
+            ),
+            None => Err(SyncError::Remote(RemoteError::Other(
+                "this pair needs OneDrive, which isn't set up here".into(),
+            ))),
+        };
         for line in lines {
             self.log(Some(i), line.level, line.message);
         }

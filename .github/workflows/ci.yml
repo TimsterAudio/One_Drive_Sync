@@ -20,14 +20,16 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy without OneDrive
+        run: cargo clippy -p one_drive_sync --no-default-features --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       - name: Build the agent
-        run: cargo build --release -p odsync-agent
+        run: cargo build --release -p folder-sync
       - uses: actions/upload-artifact@v4
         with:
-          name: odsync-agent-${{ matrix.os }}
+          name: folder-sync-${{ matrix.os }}
           path: |
-            target/release/odsync-agent
-            target/release/odsync-agent.exe
+            target/release/folder-sync
+            target/release/folder-sync.exe
           if-no-files-found: ignore

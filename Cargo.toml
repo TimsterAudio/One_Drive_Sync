@@ -1,27 +1,33 @@
 [package]
 name = "one_drive_sync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Folder sync with personal OneDrive over Microsoft Graph, shared by Timster's apps"
+description = "Two-way folder sync with a LAN share or OneDrive, shared by Timster's apps"
 authors = ["Timster's Audio Works"]
 publish = false
 
 [workspace]
 members = ["agent"]
 
+[features]
+default = ["onedrive"]
+# Syncing with OneDrive over Microsoft Graph (sign-in, keychain, HTTP).
+# Folder pairs (a LAN share) need none of it.
+onedrive = ["dep:ureq", "dep:keyring", "dep:getrandom", "dep:percent-encoding", "dep:time"]
+
 [dependencies]
-ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-keyring = "4"
 notify = "8"
 base64 = "0.22"
 sha2 = "0.10"
-getrandom = "0.3"
-percent-encoding = "2"
-time = { version = "0.3", features = ["parsing", "formatting"] }
 gethostname = "1"
 trash = "5"
+ureq = { version = "3", features = ["json"], optional = true }
+keyring = { version = "4", optional = true }
+getrandom = { version = "0.3", optional = true }
+percent-encoding = { version = "2", optional = true }
+time = { version = "0.3", features = ["parsing", "formatting"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -36,6 +36,9 @@ pub enum RemoteChange {
 pub struct Delta {
     pub changes: Vec<RemoteChange>,
     pub cursor: String,
+    /// The changes list everything there is, so anything not listed is
+    /// gone (a drive with no change journal, such as a folder).
+    pub complete: bool,
 }
 
 /// What an upload expects to find at the path.

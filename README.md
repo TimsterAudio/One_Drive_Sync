@@ -1,53 +1,85 @@
 # One_Drive_Sync
 
-A small Rust crate that keeps local folders in sync with a personal OneDrive over Microsoft Graph. A standalone sync agent uses it first; later Waypoint, Isobar and the iOS app will too. It has no ties to any of them: each pulls it in as a git dependency pinned to a commit.
+A small Rust crate and app that keep folders on two computers in step, like SyncToy. Run **Folder Sync** on the Linux machine, and it syncs its folders with folders on the Windows PC through a share mounted over the LAN. The Windows PC needs nothing installed. If those folders sit inside the PC's OneDrive folder, OneDrive's own app carries them on to the cloud and the iPhone.
 
-```toml
-[dependencies]
-one_drive_sync = { git = "https://github.com/TimsterAudio/One_Drive_Sync", rev = "<commit>" }
+The crate started as a OneDrive client. That code is still here, behind the `onedrive` feature, for when an app needs to talk to OneDrive directly; see [OneDrive](#onedrive-parked). Folder Sync doesn't build it, so it needs no Azure registration, sign-in or keychain.
+
+**Status: 0.2.0, trial.** It works end to end against local folders and in the tests. It still needs a try across a real Windows share (see [Trying it](#trying-it)).
+
+## How it fits together
+
+```
+Linux                            Windows PC
+~/Waypoint/trips  ⇄ Folder Sync ⇄  /mnt/pc-trips  =  \\PC\trips  (C:\Users\you\OneDrive\Waypoint\trips)
+~/weather         → Folder Sync →  /mnt/pc-weather =  \\PC\weather                  │
+                                                                   OneDrive app ──► cloud, iPhone
 ```
 
-**Status: trial (0.1.0).** It works end to end against the in-memory drive, and the agent builds for Linux and Windows. It still needs testing against a real OneDrive (see [Trying it](#trying-it)).
+## Trying it
 
-## What's in it
+### 1. Share the folders on the Windows PC
 
-| Module | What it does |
-|---|---|
-| `auth` | Sign-in with a personal Microsoft account: auth code + PKCE, through the system browser and an `http://localhost` loopback redirect. A public client, so no secret. The refresh token goes in the OS keychain (`keyring`: Credential Manager, Keychain, Secret Service). |
-| `graph` | `GraphDrive`: list (delta), download, upload, delete over Graph. |
-| `fake` | `FakeDrive`: an in-memory drive with OneDrive's behaviour where it matters (eTags, conditional uploads, recycle bin, delta that reports a deleted folder without its children). |
-| `engine` | One sync run of a pair. |
-| `rules` | Per-pattern rules for files changed on both sides. |
-| `state` | The per-pair state file. |
-| `worker` | `SyncService`: a thread that runs the pairs on file changes (`notify`), on a poll interval, and on request, and reports events. |
-| `agent/` | The trial egui window (`odsync-agent`). |
+For each folder (a Waypoint trip folder, the weather folder):
 
-All I/O is blocking and runs on the worker thread, which suits egui apps: the UI only reads events. **File contents are never parsed or changed**; files are copied byte for byte and compared by hash.
+1. Right-click the folder, then choose **Properties → Sharing → Advanced Sharing → Share this folder**.
+2. Under **Permissions**, give your Windows user **Change** and **Read**.
+3. Note the share name, for example `trips`. Its address is `\\PC-NAME\trips`.
 
-## Remote operations
+If the folders are inside the PC's OneDrive folder, right-click them in Explorer and choose **Always keep on this device**. That makes sure the share holds real files, not online-only placeholders.
 
-- **Listing** uses delta queries on the pair's folder, and the delta link is saved between runs. If OneDrive answers `410 Gone`, the next query lists the folder from scratch.
-- **Download:** `GET /items/{id}/content`. The file is written beside its target and then renamed into place.
-- **Upload:** `PUT .../root:/path:/content`. A new file uses `conflictBehavior=fail`; a changed file sends `If-Match: <eTag>`, so the upload fails rather than overwrite a change someone else made. Simple uploads stop at 4 MB, and larger files are skipped with a log line (upload sessions are left for after the trial).
-- **Delete:** `DELETE /items/{id}` with `If-Match`. On a personal OneDrive this puts the item in the recycle bin.
-- **Errors:** being offline, signed out or throttled (429/503, honouring `Retry-After`) stops the run, and the next poll retries it. Any other error affects only its own file.
+### 2. Mount the share on Linux
 
-## Access: app folder or whole drive
+**Option A: mount it permanently (recommended).** This is more reliable for a background sync, and it mounts at boot.
 
-`DriveScope::AppFolder` asks for `Files.ReadWrite.AppFolder` and puts every pair under `Apps/<app name>/` on OneDrive. `DriveScope::FullDrive` asks for `Files.ReadWrite` and starts pairs at the top of the drive. Both scopes add `offline_access`.
+```sh
+sudo apt install cifs-utils
+sudo mkdir -p /mnt/pc-trips
+printf 'username=YOUR_WINDOWS_USER\npassword=YOUR_PASSWORD\n' > ~/.smb-pc && chmod 600 ~/.smb-pc
+```
 
-**The recommendation is the app folder.** It is least-privilege, and it keeps everything in one tidy place. It works on one condition: everything that shares files must sign in with the **same app registration** (the same client id), because the app folder is named after the registration. One registration can serve the agent, Waypoint, Isobar and the iOS app (add an iOS redirect URI alongside `http://localhost`). If something outside that set needs to see the files (OneDrive's own website aside), use the whole drive instead.
+Then add a line to `/etc/fstab` (one per share):
 
-## Sync pairs
+```
+//PC-NAME/trips  /mnt/pc-trips  cifs  credentials=/home/YOU/.smb-pc,uid=1000,gid=1000,iocharset=utf8,nofail,_netdev,x-systemd.automount  0  0
+```
 
-A pair is a local folder, a OneDrive folder, a mode and a poll interval:
+Run `sudo mount -a`. With a Microsoft account login on Windows, the user name is the account's email address, and the password is that account's password.
 
-- **Push:** local changes go up, deletions included. A copy that changed on OneDrive is replaced (with a warning in the log). Nothing comes down, and OneDrive files that this pair never uploaded are left alone. This mode is for the weather files.
-- **TwoWay:** changes go both ways, and the rules settle files that changed on both sides.
+**Option B: mount it from the file manager.** In GNOME Files, open **Other Locations** and connect to `smb://PC-NAME/trips`. The folder then appears under `/run/user/1000/gvfs/`. This is fine for a quick try, but it disappears when you log out.
 
-The **state file** for each pair records, for every path, the last-synced content hash (OneDrive's QuickXorHash, which can be computed locally), the local size and modification time, and the remote id and eTag. It also holds the remote tree that the delta queries have described, and the delta link. A local file is re-hashed only when its size or time has moved, and a touched but unchanged file counts as unchanged. A remote file counts as changed when its eTag moved and its hash differs.
+### 3. Run Folder Sync
 
-On the first sync, a file that already exists on both sides with the same content is simply adopted. There is no conflict and no transfer.
+```sh
+cargo run --release -p folder-sync
+```
+
+CI also builds a Linux and a Windows copy on every push, under the run's artifacts.
+
+Add a pair: **This computer** is the local folder, and **Other folder** is the mounted share (use Browse…). Choose the mode:
+
+- **Two-way** for the trip folder.
+- **Push** for the weather files: this computer's changes go across, deletions included. Copies changed on the PC are replaced, nothing comes back, and files on the PC that this pair never sent are left alone.
+
+Pairs and their state are kept in `~/.local/share/folder-sync/` (`%APPDATA%\Folder Sync\` on Windows). Removing a pair touches no files.
+
+### 4. The trial plan
+
+- **Push pair** (the weather folder): new, changed and deleted files show up on the PC, and nothing comes back.
+- **Two-way pair** (a copy of a Waypoint trip folder). Try each of these:
+  - an edit on each side;
+  - the same trip edited on both sides before a sync (expect a `(conflict from HOST)` copy on both);
+  - taking and releasing a `.trip.lock` from each side;
+  - deleting a trip on one side;
+  - turning the PC off (or unmounting the share), making changes, then bringing it back.
+- Deleted files are recoverable: files deleted on the PC go to `.odsync-trash` in the share, and files deleted on Linux go to the wastebasket.
+
+## How syncing works
+
+A **pair** is a folder on this computer, the other folder, a mode and a poll interval.
+
+**Change detection.** A watcher (`notify`) on the local folder triggers a sync once the folder has been quiet for 1.5 s. Changes made on the PC can't be watched over SMB, so each pair also checks the other folder on its own interval: every 20 s by default, more often if you like. **Sync now** runs every pair straight away.
+
+**The state file** for each pair records, for every path, the content hash at the last sync plus each side's size and modification time. A file is re-hashed only when its size or time has moved, so a touched but unchanged file counts as unchanged. Hashes of the share's files are also kept in memory, so after the first run only changed files are read across the network. On the first sync, a file that already exists on both sides with the same content is simply adopted: no conflict, no copy. **File contents are never parsed or changed**; files are copied byte for byte. A file arrives under a temporary name (`*.odsync-tmp`) and is then renamed into place, so nobody ever sees it half-written.
 
 ### Rules
 
@@ -55,80 +87,55 @@ Rules are tried in order on the file name (`*` and `?` wildcards, case-insensiti
 
 | Pattern | Both sides changed | One side deleted, the other edited |
 |---|---|---|
-| `*.trip.json` | **Keep both.** OneDrive's copy keeps the name; this computer's copy becomes `name (conflict from HOST).trip.json` and syncs too | The edit survives |
+| `*.trip.json` | **Keep both.** The other side's copy keeps the name; this computer's copy becomes `name (conflict from HOST).trip.json` and syncs too | The edit survives |
 | `*.trip.lock` | **Newest wins** (by modification time) | **The deletion wins** (a released lock stays released) |
 | `*.html` | **Newest wins** | The edit survives |
 | anything else | Keep both | The edit survives |
 
-Deletions sync both ways when the other side hasn't changed. Remote deletions go to OneDrive's recycle bin and local deletions go to the system wastebasket. Some files never sync: `*.odsync-tmp` (the crate's own temporary files), `.DS_Store`, `Thumbs.db`, `desktop.ini`, `~$*` and `.~lock.*`.
+"Newest wins" compares the two machines' clocks, so keep both set automatically. Both Windows and Linux do this by default.
 
-Two safety checks protect the data:
+Deletions sync both ways when the other side hasn't changed. Some files never sync: `*.odsync-tmp`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `~$*` and `.~lock.*`.
 
-- A file modified in the last 2 seconds waits for the next run, in case it is still being written. Any file that changes between the scan and the copy also waits.
-- If one side is empty but at least 5 files were synced, the run stops rather than delete everything on the other side. That folder is more likely missing than emptied.
+### Safety checks
 
-### Change detection
-
-A watcher (`notify`) on each local folder triggers a sync once the folder has been quiet for 1.5 s. Each pair also polls on its own interval (20 s suits Waypoint), which asks OneDrive for changes and catches anything the watcher missed. **Sync now** runs every pair straight away.
+- **A missing share stops the run.** If the share isn't mounted (the PC is off, the network is down), the pair shows the error and retries at the next check. Nothing is deleted.
+- **An empty share stops the run.** If the share's folder is there but empty while files were synced, the run stops rather than delete everything here. An empty mount point usually means nothing is mounted. If you really did empty one side, empty the other side too.
+- **Fresh files wait.** A file modified in the last 2 seconds waits for the next run, in case it is still being written. Any file that changes between the scan and the copy also waits.
+- **Changes on the PC aren't overwritten.** A copy to the share checks first that the file there hasn't changed since the scan; if it has, the next run settles it by the rules. Push mode is the exception, and the log says so when it replaces a file.
 
 ## Using it in an app
 
 ```rust
-use std::sync::Arc;
 use one_drive_sync::*;
 
-let auth = Arc::new(Auth::new(CLIENT_ID, DriveScope::AppFolder,
-    Box::new(KeyringStore::new("Waypoint", CLIENT_ID))));
-// Once, from a button: opens the browser, waits for the redirect.
-auth.sign_in(&mut |url| open::that(url), &cancel)?;
-
-let drive = GraphDrive::new(auth.clone(), DriveScope::AppFolder);
-let service = SyncService::start(Box::new(drive), state_dir, SyncOptions::default(),
+let service = SyncService::start_folders(state_dir, SyncOptions::default(),
     Box::new(move || ctx.request_repaint()));
-service.set_pairs(vec![PairConfig::new(trips_dir, "Waypoint/trips", Mode::TwoWay)]);
+service.set_pairs(vec![PairConfig::folders(trips_dir, "/mnt/pc-trips", Mode::TwoWay)]);
 // Each frame:
 for event in service.events() { /* Event::Log, Event::Status */ }
 ```
 
-`PairConfig` and `Rules` are serde types, so an app can save them with its settings.
-
-## Trying it
-
-### 1. Register the app in Azure (once)
-
-1. Go to <https://entra.microsoft.com> (or portal.azure.com) → **App registrations** → **New registration**.
-2. **Name:** this becomes the OneDrive folder `Apps/<name>/`, for example "Timster Sync".
-3. **Supported account types:** *Personal Microsoft accounts only*.
-4. **Redirect URI:** platform *Public client/native (mobile & desktop)*, value `http://localhost`. Any port is accepted, and the agent picks a free one.
-5. Under **API permissions**, add the delegated Microsoft Graph permissions `Files.ReadWrite.AppFolder` (or `Files.ReadWrite` for the whole drive) and `offline_access`.
-6. Copy the **Application (client) ID**. No secret is needed.
-
-### 2. Run the agent
-
-```sh
-cargo run --release -p odsync-agent
+```toml
+one_drive_sync = { git = "https://github.com/TimsterAudio/One_Drive_Sync", rev = "<commit>", default-features = false }
 ```
 
-For Windows, CI builds `odsync-agent.exe`; it is also available locally with `cargo build --release -p odsync-agent --target x86_64-pc-windows-gnu`.
+`PairConfig` and `Rules` are serde types, so an app can save them with its settings. Under the hood, the engine talks to a `RemoteDrive`. `FolderDrive` is one for a folder; `FakeDrive` is an in-memory one for tests.
 
-Paste the client id under **Settings** (or set `ODSYNC_CLIENT_ID`), click **Apply**, then **Sign in**. Settings and pair state are kept in `~/.local/share/onedrive-sync-agent/` on Linux and `%APPDATA%\OneDrive Sync Agent\` on Windows.
+## OneDrive (parked)
 
-On Linux the token needs a Secret Service (GNOME Keyring or KWallet). Without one, signing in fails with a message about the keychain.
+With the default `onedrive` feature, the crate also syncs pairs directly with a personal OneDrive over Microsoft Graph (`GraphDrive`, `Auth`):
 
-### 3. The trial plan
+- **Sign-in:** auth code + PKCE in the browser, with the refresh token in the OS keychain.
+- **Changes:** delta queries.
+- **Uploads:** conditional on the eTag (`If-Match`).
+- **Deletes:** to the recycle bin.
 
-- A **push pair**: the weather folder → `weather`. Check that new, changed and deleted files appear on OneDrive, and that nothing comes down.
-- A **two-way pair**: a *copy* of a Waypoint trip folder → `Waypoint/trips`, on both the Linux and the Windows machine. Try:
-  - an edit on each side, synced one after the other;
-  - the same trip edited on both machines before either syncs (expect a `(conflict from HOST)` copy on both);
-  - taking and releasing a `.trip.lock` from each side;
-  - deleting a trip on one side;
-  - unplugging the network, making changes, then reconnecting.
-- Look in OneDrive's recycle bin for the deleted files.
+It needs an Azure app registration, with personal accounts, the `http://localhost` redirect, and `Files.ReadWrite.AppFolder` + `offline_access`. That registration is the step that made it heavy for now. Start such pairs with `SyncService::start(Box::new(GraphDrive::new(...)), ...)`.
 
 ## Not in the trial
 
-Upload sessions (files over 4 MB), a tray icon, autostart, installers, Waypoint integration and the iOS app are all left out. Two OneDrive limits also apply: names that differ only in case aren't told apart (OneDrive is case-insensitive), and files whose names OneDrive refuses won't upload.
+- A tray icon, autostart and installers. For now, run it from a terminal or a startup entry.
+- Names that differ only in case aren't told apart, because Windows doesn't tell them apart either.
 
 ## Checks before pushing
 

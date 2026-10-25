@@ -1,19 +1,18 @@
 [package]
-name = "odsync-agent"
-version = "0.1.0"
+name = "folder-sync"
+version = "0.2.0"
 edition = "2021"
-description = "Trial OneDrive sync agent: sign in, add folder pairs, sync"
+description = "Folder Sync: keeps local folders in step with a mounted LAN share"
 publish = false
 
 [[bin]]
-name = "odsync-agent"
+name = "folder-sync"
 path = "src/main.rs"
 
 [dependencies]
-one_drive_sync = { path = ".." }
+one_drive_sync = { path = "..", default-features = false }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
 rfd = "0.17"
-open = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }

@@ -364,6 +364,7 @@ impl RemoteDrive for FakeDrive {
         Ok(Delta {
             changes,
             cursor: inner.seq.to_string(),
+            complete: false,
         })
     }
 

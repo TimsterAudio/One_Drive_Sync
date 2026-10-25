@@ -358,6 +358,7 @@ impl RemoteDrive for GraphDrive {
                     return Ok(Delta {
                         changes,
                         cursor: delta,
+                        complete: false,
                     })
                 }
                 (None, None) => {

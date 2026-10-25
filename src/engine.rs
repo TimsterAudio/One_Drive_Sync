@@ -16,13 +16,13 @@ use crate::state::{PairState, RemoteFile, Synced};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
-    /// Local changes go up; OneDrive's copy is replaced, even if it changed.
+    /// Local changes go across; the other side's copy is replaced, even if it changed.
     Push,
     /// Changes go both ways; the pair's rules settle files changed on both.
     TwoWay,
 }
 
-/// A local folder kept in sync with a OneDrive folder.
+/// A local folder kept in sync with a OneDrive folder or another folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairConfig {
     pub local: PathBuf,
@@ -30,11 +30,16 @@ pub struct PairConfig {
     /// the whole drive), `/`-separated.
     pub remote: String,
     pub mode: Mode,
-    /// How often to ask OneDrive for changes, in seconds.
+    /// How often to look for changes on the other side, in seconds.
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
     #[serde(default)]
     pub rules: Rules,
+    /// When set, the other side is this folder (a mounted LAN share, a USB
+    /// drive) instead of OneDrive, and `remote` is a subfolder of it
+    /// (usually empty).
+    #[serde(default)]
+    pub share: Option<PathBuf>,
 }
 
 fn default_poll_secs() -> u64 {
@@ -49,6 +54,24 @@ impl PairConfig {
             mode,
             poll_secs: default_poll_secs(),
             rules: Rules::default(),
+            share: None,
+        }
+    }
+
+    /// A pair whose other side is the folder `share` rather than OneDrive.
+    pub fn folders(local: impl Into<PathBuf>, share: impl Into<PathBuf>, mode: Mode) -> Self {
+        Self {
+            share: Some(share.into()),
+            ..Self::new(local, "", mode)
+        }
+    }
+
+    /// Names the other side, for the state file and messages.
+    pub fn remote_name(&self) -> String {
+        match &self.share {
+            Some(s) if self.remote.is_empty() => s.display().to_string(),
+            Some(s) => format!("{}/{}", s.display(), self.remote),
+            None => self.remote.clone(),
         }
     }
 
@@ -139,10 +162,10 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
         for (n, what) in [
-            (self.uploaded, "uploaded"),
-            (self.downloaded, "downloaded"),
+            (self.uploaded, "copied there"),
+            (self.downloaded, "copied here"),
             (self.deleted_local, "deleted here"),
-            (self.deleted_remote, "deleted on OneDrive"),
+            (self.deleted_remote, "deleted there"),
             (self.conflicts, "conflicts kept"),
             (self.deferred, "waiting"),
             (self.failed, "failed"),
@@ -221,10 +244,11 @@ pub fn sync(
     }
     let mut state = PairState::load(state_path)?;
     let local_key = pair.local.to_string_lossy().into_owned();
-    if state.local != local_key || state.remote != pair.remote {
+    let remote_key = pair.remote_name();
+    if state.local != local_key || state.remote != remote_key {
         state = PairState {
             local: local_key,
-            remote: pair.remote.clone(),
+            remote: remote_key,
             ..Default::default()
         };
     }
@@ -335,21 +359,29 @@ impl Run<'_> {
     /// Stops a run that would empty one side because the other is empty.
     fn guard(&self, local_count: usize, remote_count: usize) -> Result<(), SyncError> {
         let synced = self.state.synced.len();
-        if synced < self.opts.guard_min.max(1) {
+        // An empty share is most likely an empty mount point, so for folder
+        // pairs a single synced file is enough to stop.
+        let min = if self.pair.share.is_some() {
+            1
+        } else {
+            self.opts.guard_min.max(1)
+        };
+        if synced < min {
             return Ok(());
         }
         if local_count == 0 && remote_count > 0 {
             return Err(SyncError::Guard(format!(
                 "the local folder {} is empty but {synced} files were synced; not deleting \
-                 them from OneDrive. Restore the folder, or empty the OneDrive folder too.",
-                self.pair.local.display()
+                 them from {}. Restore the folder, or empty the other side too.",
+                self.pair.local.display(),
+                self.pair.remote_name()
             )));
         }
         if remote_count == 0 && local_count > 0 {
             return Err(SyncError::Guard(format!(
-                "the OneDrive folder {} is empty but {synced} files were synced; not deleting \
-                 them here. Restore it on OneDrive, or empty the local folder too.",
-                self.pair.remote
+                "{} is empty (or not mounted) but {synced} files were synced; not deleting \
+                 them here. Restore it, or empty the local folder too.",
+                self.pair.remote_name()
             )));
         }
         Ok(())
@@ -366,7 +398,7 @@ impl Run<'_> {
             RemoteError::Conflict => {
                 self.say(
                     Level::Info,
-                    format!("{rel}: changed on OneDrive meanwhile; next run settles it"),
+                    format!("{rel}: changed on the other side meanwhile; next run settles it"),
                 );
                 self.report.deferred += 1;
             }
@@ -412,7 +444,9 @@ impl Run<'_> {
                         Err(RemoteError::Conflict) => {
                             self.say(
                                 Level::Warn,
-                                format!("{rel}: changed on OneDrive; push mode deletes it anyway"),
+                                format!(
+                                    "{rel}: changed on the other side; push mode deletes it anyway"
+                                ),
                             );
                             match self.drive.delete(&b.remote_id, None) {
                                 Ok(()) | Err(RemoteError::NotFound) => {}
@@ -429,7 +463,7 @@ impl Run<'_> {
                     }
                     self.state.synced.remove(&rel);
                     self.report.deleted_remote += 1;
-                    self.say(Level::Info, format!("{rel}: deleted on OneDrive"));
+                    self.say(Level::Info, format!("{rel}: deleted on the other side"));
                     self.save()?;
                 }
                 (None, None) => {}
@@ -456,7 +490,7 @@ impl Run<'_> {
             r => r?,
         };
         let tree = &mut self.state.tree;
-        if tree.cursor.is_none() {
+        if tree.cursor.is_none() || delta.complete {
             tree.nodes.clear();
         }
         tree.apply(delta.changes);
@@ -538,7 +572,7 @@ impl Run<'_> {
                 self.state.synced.remove(rel);
             }
 
-            // Changed on OneDrive only.
+            // Changed on the other side only.
             (false, true, _, Some(r)) => self.download(rel, l, r)?,
             (false, true, Some(_), None) => self.delete_local(rel, l)?,
             (false, true, None, None) => {
@@ -565,7 +599,7 @@ impl Run<'_> {
                         } else {
                             self.say(
                                 Level::Info,
-                                format!("{rel}: both changed; OneDrive's is newer"),
+                                format!("{rel}: both changed; the other side's is newer"),
                             );
                             self.download(rel, l, r)?;
                         }
@@ -573,23 +607,23 @@ impl Run<'_> {
                     BothChanged::KeepBoth => self.keep_both(rel, l, r, local, remote)?,
                 }
             }
-            // Edited on OneDrive, deleted here.
+            // Edited on the other side, deleted here.
             (true, true, None, Some(r)) => match rule.delete_vs_edit {
                 DeleteVsEdit::KeepEdit => {
                     self.say(
                         Level::Info,
-                        format!("{rel}: deleted here but changed on OneDrive; keeping it"),
+                        format!("{rel}: deleted here but changed on the other side; keeping it"),
                     );
                     self.download(rel, l, r)?;
                 }
                 DeleteVsEdit::Delete => self.delete_remote(rel, r)?,
             },
-            // Edited here, deleted on OneDrive.
+            // Edited here, deleted on the other side.
             (true, true, Some(_), None) => match rule.delete_vs_edit {
                 DeleteVsEdit::KeepEdit => {
                     self.say(
                         Level::Info,
-                        format!("{rel}: deleted on OneDrive but changed here; keeping it"),
+                        format!("{rel}: deleted on the other side but changed here; keeping it"),
                     );
                     self.upload(rel, l, Precondition::New, false)?;
                 }
@@ -649,7 +683,7 @@ impl Run<'_> {
         if overwrite_on_conflict && matches!(result, Err(RemoteError::Conflict)) {
             self.say(
                 Level::Warn,
-                format!("{rel}: replacing OneDrive's copy (push mode)"),
+                format!("{rel}: replacing the other side's copy (push mode)"),
             );
             result = self
                 .drive
@@ -664,12 +698,12 @@ impl Run<'_> {
             self.state.tree.record_upload(rel, item);
         }
         self.report.uploaded += 1;
-        self.say(Level::Info, format!("{rel}: uploaded"));
+        self.say(Level::Info, format!("{rel}: copied there"));
         self.save()?;
         Ok(())
     }
 
-    /// Makes sure the folders above `rel` exist on OneDrive and are in the
+    /// Makes sure the folders above `rel` exist on the other side and are in the
     /// tree, so a later move or delete of them reaches the file.
     fn ensure_dirs(&mut self, rel: &str) -> Result<(), RemoteError> {
         let parts: Vec<&str> = rel.split('/').collect();
@@ -724,7 +758,7 @@ impl Run<'_> {
             },
         );
         self.report.downloaded += 1;
-        self.say(Level::Info, format!("{rel}: downloaded"));
+        self.say(Level::Info, format!("{rel}: copied here"));
         self.save()?;
         Ok(())
     }
@@ -739,7 +773,7 @@ impl Run<'_> {
         self.report.deleted_remote += 1;
         self.say(
             Level::Info,
-            format!("{rel}: moved to OneDrive's recycle bin"),
+            format!("{rel}: deleted on the other side (to its recycle bin)"),
         );
         self.save()?;
         Ok(())
@@ -759,14 +793,14 @@ impl Run<'_> {
         self.report.deleted_local += 1;
         self.say(
             Level::Info,
-            format!("{rel}: deleted here (deleted on OneDrive)"),
+            format!("{rel}: deleted here (deleted on the other side)"),
         );
         self.save()?;
         Ok(())
     }
 
     /// Keeps both copies: this computer's is renamed with a conflict name and
-    /// uploaded; OneDrive's comes down under the original name.
+    /// uploaded; the other side's comes down under the original name.
     fn keep_both(
         &mut self,
         rel: &str,
