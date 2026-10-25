@@ -1,6 +1,6 @@
 [package]
 name = "one_drive_sync"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Two-way folder sync with a LAN share or OneDrive, shared by Timster's apps"
 authors = ["Timster's Audio Works"]

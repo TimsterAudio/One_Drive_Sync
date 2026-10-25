@@ -4,6 +4,13 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
+## 0.2.1 – 2026-10-25
+
+Folder Sync only; the crate is unchanged.
+
+- **Start when I log in**: a checkbox that adds or removes an XDG autostart entry (`~/.config/autostart/folder-sync.desktop`, read by Cinnamon, GNOME, KDE and Xfce). It starts Folder Sync minimised, 10 s after login, and the entry follows the program if it moves. Not offered on Windows yet.
+- `folder-sync --minimized` starts with the window minimised.
+
 ## 0.2.0 – 2026-10-25 (trial) – commit f0a76dd
 
 De-scoped to folder sync over the LAN: the Linux machine syncs with folders on the Windows PC through a mounted share, and OneDrive's own app takes them on from there.

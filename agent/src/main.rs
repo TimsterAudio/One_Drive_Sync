@@ -5,6 +5,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +72,9 @@ struct App {
     service: SyncService,
     statuses: Vec<PairStatus>,
     log: VecDeque<LogEntry>,
+    /// Where the login entry goes; `None` where autostart isn't offered.
+    autostart_dir: Option<PathBuf>,
+    autostart_on: bool,
     // The add-pair form.
     new_local: String,
     new_share: String,
@@ -93,7 +98,10 @@ fn short(path: &Path) -> String {
 }
 
 impl App {
-    fn new(ctx: egui::Context, offset: UtcOffset) -> Self {
+    fn new(ctx: egui::Context, offset: UtcOffset, minimized: bool) -> Self {
+        if minimized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         let settings = Settings::load();
         let service = SyncService::start_folders(
             data_dir().join("state"),
@@ -107,11 +115,22 @@ impl App {
             offset,
             service,
             log: VecDeque::new(),
+            autostart_on: autostart::dir().is_some_and(|d| autostart::is_on(&d)),
+            autostart_dir: autostart::dir(),
             new_local: String::new(),
             new_share: String::new(),
             new_mode: Mode::TwoWay,
             new_poll: 20,
         };
+        if let (true, Some(dir), Ok(exe)) = (
+            app.autostart_on,
+            app.autostart_dir.clone(),
+            std::env::current_exe(),
+        ) {
+            if let Err(e) = autostart::refresh(&dir, &exe) {
+                app.note(Level::Warn, format!("Couldn't update the login entry: {e}"));
+            }
+        }
         if app.settings.pairs.is_empty() {
             app.note(Level::Info, "Add a folder pair below to start.");
         }
@@ -218,7 +237,44 @@ impl App {
             {
                 self.service.sync_now();
             }
+            if self.autostart_dir.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = self.autostart_on;
+                    let check = ui
+                        .checkbox(&mut on, "Start when I log in")
+                        .on_hover_text("Opens Folder Sync, minimised, each time you log in.");
+                    if check.changed() {
+                        self.set_autostart(on);
+                    }
+                });
+            }
         });
+    }
+
+    fn set_autostart(&mut self, on: bool) {
+        let Some(dir) = self.autostart_dir.clone() else {
+            return;
+        };
+        let result =
+            std::env::current_exe().and_then(|exe| autostart::set(&dir, on, &exe).map(|_| exe));
+        match result {
+            Ok(exe) => {
+                self.autostart_on = on;
+                let text = if on {
+                    format!(
+                        "Folder Sync will start when you log in ({}).",
+                        exe.display()
+                    )
+                } else {
+                    "Folder Sync won't start when you log in.".to_string()
+                };
+                self.note(Level::Info, text);
+            }
+            Err(e) => self.note(
+                Level::Error,
+                format!("Couldn't change the login entry: {e}"),
+            ),
+        }
     }
 
     fn pairs_section(&mut self, ui: &mut egui::Ui) {
@@ -393,6 +449,7 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     // Read before any thread starts; on Linux it can't be read safely after.
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let minimized = std::env::args().any(|a| a == autostart::MINIMIZED_ARG);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP)
@@ -403,6 +460,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP,
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), offset)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), offset, minimized)))),
     )
 }

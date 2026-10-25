@@ -60,6 +60,8 @@ Add a pair: **This computer** is the local folder, and **Other folder** is the m
 - **Two-way** for the trip folder.
 - **Push** for the weather files: this computer's changes go across, deletions included. Copies changed on the PC are replaced, nothing comes back, and files on the PC that this pair never sent are left alone.
 
+To have it start by itself, tick **Start when I log in** (top right). This adds an entry to `~/.config/autostart/`, which Linux Mint's Cinnamon (and GNOME, KDE, Xfce) reads at login. Folder Sync then opens minimised, 10 seconds after login, giving network shares time to mount. If a share isn't mounted yet, the pair shows an error and retries at its next check. The entry points at the copy of `folder-sync` that ticked the box, so tick it from the copy you'll keep (say, `~/.local/bin/folder-sync`). Untick the box to remove the entry. You can also see and toggle it in Mint's **Startup Applications**.
+
 Pairs and their state are kept in `~/.local/share/folder-sync/` (`%APPDATA%\Folder Sync\` on Windows). Removing a pair touches no files.
 
 ### 4. The trial plan
@@ -134,7 +136,7 @@ It needs an Azure app registration, with personal accounts, the `http://localhos
 
 ## Not in the trial
 
-- A tray icon, autostart and installers. For now, run it from a terminal or a startup entry.
+- A tray icon and installers. Autostart on Windows (Linux has it, above).
 - Names that differ only in case aren't told apart, because Windows doesn't tell them apart either.
 
 ## Checks before pushing

@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "folder-sync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "one_drive_sync",
@@ -2629,7 +2629,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "one_drive_sync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "gethostname",
