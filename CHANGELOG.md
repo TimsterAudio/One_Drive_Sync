@@ -4,7 +4,7 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
-## 0.1.0 – 2026-10-25 (trial)
+## 0.1.0 – 2026-10-25 (trial) – commit 413f985
 
 First version, for the trial agent.
 
