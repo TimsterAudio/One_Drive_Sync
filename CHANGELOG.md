@@ -4,7 +4,7 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
-## 0.2.0 – 2026-10-25 (trial)
+## 0.2.0 – 2026-10-25 (trial) – commit f0a76dd
 
 De-scoped to folder sync over the LAN: the Linux machine syncs with folders on the Windows PC through a mounted share, and OneDrive's own app takes them on from there.
 
