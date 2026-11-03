@@ -4,6 +4,15 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
+## 0.3.2 – 2026-11-03
+
+Folder Sync only; the crate is unchanged.
+
+- Fixed: at login, shares often stayed disconnected until opened in Files. Three causes:
+  - The keyring library made its connection once; if the keyring wasn't up (or unlocked) when Folder Sync first asked, every later read failed until a restart. The keyring is now reached afresh each time (through `keyring-core` and its stores directly).
+  - A share that failed with no password sent ("password needed", because the keyring couldn't be read yet) was treated like a refused password and never retried. Only a refused password that Folder Sync sent stops the retries now.
+  - A share that was down was retried once a minute; it's now every 15 s, so it connects soon after the network and keyring are up.
+
 ## 0.3.1 – 2026-10-25 – commit e3cb941
 
 Folder Sync only; the crate is unchanged.

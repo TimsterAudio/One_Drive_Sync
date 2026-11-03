@@ -34,8 +34,8 @@ Run Folder Sync (next step). Under **Shares on other computers**, enter the PC's
 Folder Sync connects through GVFS, the same service the file manager uses for **Connect to Server**, so it needs no root and no command line. On Mint it's already installed; elsewhere, install `gvfs-backends` and `gvfs-fuse`. A connected share appears as a folder under `/run/user/1000/gvfs/`, and the **Shares…** button in the pair form fills that folder in.
 
 - **The password is asked for once.** It's saved in the system keyring (Passwords and Keys, unlocked when you log in), and used from then on: at every start and every reconnect. If there's no keyring to save it in, it goes in `~/.local/share/folder-sync/passwords.json`, which only you can read (like an `~/.smbcredentials` file), and the log says so. **Remove** forgets it.
-- **Shares reconnect by themselves:** at start, and within a minute of dropping (the PC slept, the network blinked). Meanwhile the pairs on that share wait, and nothing is deleted.
-- **A refused password is not retried.** That way a stale password can't lock your Windows account. The share asks for the password again instead.
+- **Shares reconnect by themselves:** at login, as soon as the network and the keyring are up, and after dropping (the PC slept, the network blinked). A share that's down is retried every 15 seconds. Meanwhile the pairs on that share wait, and nothing is deleted.
+- **A refused password is not retried.** (Only one Folder Sync actually sent; a share that's waiting for the keyring keeps trying.) That way a stale password can't lock your Windows account. The share asks for the password again instead.
 - **Disconnect** keeps a share disconnected until you click **Connect**. **Remove** disconnects it and forgets its password.
 
 A pair set up on a share you connected in the file manager (Nemo) works too: Folder Sync spots the share in the pair's folder, adds it to the list and reconnects it from then on. If you ticked "Remember forever" when connecting in Nemo, that saved password is used; otherwise Folder Sync asks for it once.

@@ -3,22 +3,29 @@
 //! password kept in the system keyring. A mounted share shows up as a folder
 //! under `/run/user/<uid>/gvfs/`, which pairs then sync with.
 //!
-//! A thread keeps the shares mounted: it checks them every minute and
-//! remounts any that dropped (the PC slept, the network blinked). A share
-//! whose login was refused isn't retried until the password is entered again,
-//! so a stale password can't lock the Windows account.
+//! A thread keeps the shares mounted: it checks them every minute, and
+//! retries one that's down every 15 s (at login, until the network and the
+//! keyring are up; later, after the PC slept or the network blinked). A share
+//! whose password was refused isn't retried until the password is entered
+//! again, so a stale password can't lock the Windows account.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use keyring_core::api::CredentialStore;
 use serde::{Deserialize, Serialize};
 
 const KEYRING_SERVICE: &str = "Folder Sync";
+/// How often mounted shares are checked.
 const CHECK_EVERY: Duration = Duration::from_secs(60);
+/// How often a share that's down is retried (after login, the network and
+/// the keyring can take a while).
+const RETRY_EVERY: Duration = Duration::from_secs(15);
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A share on another computer: `\\server\name`.
@@ -355,9 +362,32 @@ fn unmount(share: &Share) {
         .status();
 }
 
+/// The system keyring, reached afresh each time: a connection kept from
+/// before the keyring was up (or unlocked) at login can stay broken.
+fn keyring() -> Option<Arc<CredentialStore>> {
+    connect_keyring()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn connect_keyring() -> Option<Arc<CredentialStore>> {
+    let store = zbus_secret_service_keyring_store::Store::new().ok()?;
+    Some(store)
+}
+
+#[cfg(windows)]
+fn connect_keyring() -> Option<Arc<CredentialStore>> {
+    let store = windows_native_keyring_store::Store::new().ok()?;
+    Some(store)
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+fn connect_keyring() -> Option<Arc<CredentialStore>> {
+    None
+}
+
 /// The keyring entry holding a share's password.
-fn keyring_entry(share: &Share) -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, &share.key()).ok()
+fn keyring_entry(share: &Share) -> Option<keyring_core::Entry> {
+    keyring()?.build(KEYRING_SERVICE, &share.key(), None).ok()
 }
 
 /// Where a password was saved.
@@ -525,6 +555,11 @@ struct Tracked {
     state: MountState,
     /// Unmounted on request: not remounted until asked.
     held: bool,
+    /// A password Folder Sync sent was refused: not retried until a new one
+    /// is entered, so it can't lock the Windows account. A failure with no
+    /// password sent (none saved yet, or the keyring not unlocked yet at
+    /// login) doesn't count.
+    refused: bool,
 }
 
 fn run(
@@ -553,14 +588,7 @@ fn run(
             t.state = MountState::Mounted(p);
             return Some(None);
         }
-        let blocked = matches!(
-            t.state,
-            MountState::Failed {
-                bad_login: true,
-                ..
-            }
-        );
-        if !forced && (t.held || blocked) {
+        if !forced && (t.held || t.refused) {
             return None;
         }
         // No password of ours: try anyway, in case GVFS has one saved.
@@ -584,6 +612,7 @@ fn run(
                         Tracked {
                             state: old.map_or(MountState::Unknown, |t| t.state.clone()),
                             held: old.is_some_and(|t| t.held),
+                            refused: old.is_some_and(|t| t.refused),
                             share,
                         }
                     })
@@ -592,6 +621,7 @@ fn run(
             Some(Cmd::Mount(key, password)) => {
                 if let Some(t) = shares.iter_mut().find(|t| t.share.key() == key) {
                     t.held = false;
+                    t.refused = false;
                     if let Some(p) = password {
                         let note = match passwords.set(&t.share, p) {
                             Saved::Keyring => "password saved in the keyring".to_string(),
@@ -642,6 +672,14 @@ fn run(
                     t.state = MountState::Mounting;
                     send(t, None);
                     t.state = mount(&t.share, password.as_deref());
+                    t.refused = password.is_some()
+                        && matches!(
+                            t.state,
+                            MountState::Failed {
+                                bad_login: true,
+                                ..
+                            }
+                        );
                     let note = match &t.state {
                         MountState::Mounted(p) => Some(format!(
                             "{}: connected at {}.",
@@ -659,7 +697,10 @@ fn run(
                 }
             }
         }
-        next_check = Instant::now() + CHECK_EVERY;
+        let waiting = shares
+            .iter()
+            .any(|t| !t.held && !t.refused && !matches!(t.state, MountState::Mounted(_)));
+        next_check = Instant::now() + if waiting { RETRY_EVERY } else { CHECK_EVERY };
     }
 }
 
