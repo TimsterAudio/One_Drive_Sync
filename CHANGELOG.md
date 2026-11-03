@@ -4,6 +4,13 @@ Apps pin a commit; each version below names its commit once pushed.
 
 ## Unreleased
 
+## 0.3.3 – 2026-11-03
+
+Folder Sync only; the crate is unchanged.
+
+- Fixed: a share added by hand (domain WORKGROUP) for a pair made in Files (domain Home, say) connected at a different folder from the pair's, since GVFS puts the domain in the folder's name, so the pair stayed offline. The share now takes the pair's domain and reconnects.
+- Fixed: **Copy** (and copy and paste in text fields) did nothing; the window was built without clipboard support.
+
 ## 0.3.2 – 2026-11-03 – commit afd751b
 
 Folder Sync only; the crate is unchanged.

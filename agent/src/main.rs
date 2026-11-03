@@ -392,22 +392,51 @@ impl App {
             .iter()
             .filter_map(|p| p.share.as_deref().and_then(Share::from_gvfs_path))
             .collect();
-        let mut added = false;
+        let mut changed = false;
+        let mut remount = Vec::new();
         for share in found {
-            if self.settings.shares.iter().any(|s| s.key() == share.key()) {
-                continue;
+            match self
+                .settings
+                .shares
+                .iter_mut()
+                .find(|s| s.same_share(&share))
+            {
+                // Listed with another domain: GVFS puts the domain in the
+                // folder's name, so the pair would never find its folder.
+                Some(listed) if !listed.domain.eq_ignore_ascii_case(&share.domain) => {
+                    let note = format!(
+                        "{}: connecting with domain \"{}\" (not \"{}\") so it opens at the folder the pair uses.",
+                        listed.label(),
+                        share.domain,
+                        listed.domain
+                    );
+                    remount.push(listed.key());
+                    listed.domain = share.domain.clone();
+                    changed = true;
+                    self.note(Level::Info, note);
+                }
+                Some(_) => {}
+                None => {
+                    self.note(
+                        Level::Info,
+                        format!(
+                            "Found {} in a pair; Folder Sync will connect it from now on.",
+                            share.label()
+                        ),
+                    );
+                    self.settings.shares.push(share);
+                    changed = true;
+                }
             }
-            self.note(
-                Level::Info,
-                format!(
-                    "Found {} in a pair; Folder Sync will connect it from now on.",
-                    share.label()
-                ),
-            );
-            self.settings.shares.push(share);
-            added = true;
         }
-        if added {
+        // Disconnect the old mounts before the list changes, so the
+        // disconnect reaches them; the new list then connects afresh.
+        if let Some(m) = &self.mounter {
+            for key in &remount {
+                m.unmount(key);
+            }
+        }
+        if changed {
             self.shares_changed();
         }
     }

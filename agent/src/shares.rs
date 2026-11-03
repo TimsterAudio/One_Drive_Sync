@@ -105,6 +105,14 @@ impl Share {
         )
     }
 
+    /// The same share for the same user, whatever the domain.
+    pub fn same_share(&self, other: &Share) -> bool {
+        let eq = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+        eq(&self.server, &other.server)
+            && eq(&self.name, &other.name)
+            && eq(&self.user, &other.user)
+    }
+
     /// `\\server\name`, as Windows writes it.
     pub fn label(&self) -> String {
         format!("\\\\{}\\{}", self.server.trim(), self.name.trim())
@@ -794,6 +802,26 @@ mod tests {
         pw.write_file(&HashMap::new()).unwrap();
         assert!(!pw.file.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_share_ignores_domain_and_case() {
+        let a = Share {
+            server: "192.168.0.2".into(),
+            name: "documents".into(),
+            user: "Tim & Sarah".into(),
+            domain: "WORKGROUP".into(),
+        };
+        let b = Share {
+            name: "Documents".into(),
+            domain: "Home".into(),
+            ..a.clone()
+        };
+        assert!(a.same_share(&b));
+        assert!(!a.same_share(&Share {
+            user: "someone".into(),
+            ..a.clone()
+        }));
     }
 
     #[test]
